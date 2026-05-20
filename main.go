@@ -2,12 +2,16 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"strconv"
 
 	"dygma-indicator/internal/neuron"
 )
+
+// version is overridable at build time via `-ldflags '-X main.version=...'`.
+var version = "dev"
 
 // sideStatus mirrors `wireless.battery.<side>.status` returned by the firmware.
 // 0 = discharging, 1 = charging, 4 = unreachable (RF off / out of range).
@@ -138,22 +142,40 @@ func emitErrorJSON(err error) {
 }
 
 func main() {
-	if err := run(); err != nil {
+	deviceFlag := flag.String("device", "", "Serial device path (default: auto-detect)")
+	debugFlag := flag.Bool("debug", false, "Log serial traffic to stderr")
+	versionFlag := flag.Bool("version", false, "Print version and exit")
+	flag.Parse()
+
+	if *versionFlag {
+		fmt.Printf("dygma-indicator %s\n", version)
+		return
+	}
+
+	if err := run(*deviceFlag, *debugFlag); err != nil {
 		emitErrorJSON(err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	dev, err := neuron.FindDev()
-	if err != nil {
-		return fmt.Errorf("could not find keyboard: %w", err)
+func run(device string, debug bool) error {
+	dev := device
+	if dev == "" {
+		var err error
+		dev, err = neuron.FindDev()
+		if err != nil {
+			return fmt.Errorf("could not find keyboard: %w", err)
+		}
 	}
 	client, err := neuron.Open(dev)
 	if err != nil {
 		return fmt.Errorf("failed to open port: %w", err)
 	}
 	defer client.Close()
+
+	if debug {
+		client.SetDebug(os.Stderr)
+	}
 
 	battery := batteryLevel{}
 	// Bail on the first failure: a timed-out reply may still arrive later
