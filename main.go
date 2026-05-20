@@ -16,11 +16,20 @@ import (
 
 var vendorIds = []string{"1209", "35ef"}
 
+// sideStatus mirrors `wireless.battery.<side>.status` returned by the firmware.
+// 0 = discharging, 1 = charging, 4 = unreachable (RF off / out of range).
+// Any other value is treated as discharging so we still surface the level.
+type sideStatus int
+
+const (
+	statusDischarging  sideStatus = 0
+	statusCharging     sideStatus = 1
+	statusDisconnected sideStatus = 4
+)
+
 type batteryLevel struct {
-	Left          int  `json:"left"`
-	Right         int  `json:"right"`
-	LeftCharging  bool `json:"leftCharging"`
-	RightCharging bool `json:"rightCharging"`
+	Left, Right             int
+	LeftStatus, RightStatus sideStatus
 }
 
 type WaybarOutput struct {
@@ -82,21 +91,26 @@ func queryBatteryField(port serial.Port, side, field string, ch <-chan int, errC
 	}
 }
 
-// chargingAwarePercentage returns a value suitable for waybar's icon picker:
-// the lowest level among sides that are NOT charging, since charging sides
-// report a 99 placeholder rather than a real reading. If both sides are
-// charging, returns 100 (rather than the firmware's 99) so the icon picker
-// lands on the "full" bucket — semantically "plugged in, treat as full".
-func chargingAwarePercentage(b batteryLevel) int {
+// percentageForIcon picks a value for waybar's icon picker. The firmware
+// returns placeholder levels for non-discharging sides (99 when charging,
+// 100 when the side is unreachable), so we use only sides whose status is
+// "discharging" for the icon. If no side has a real reading, fall back to
+// 100 if any side is charging (semantically "full") or 0 otherwise
+// (semantically "no battery info").
+func percentageForIcon(b batteryLevel) int {
+	leftReal := b.LeftStatus == statusDischarging
+	rightReal := b.RightStatus == statusDischarging
 	switch {
-	case b.LeftCharging && b.RightCharging:
-		return 100
-	case b.LeftCharging:
-		return b.Right
-	case b.RightCharging:
-		return b.Left
-	default:
+	case leftReal && rightReal:
 		return min(b.Left, b.Right)
+	case leftReal:
+		return b.Left
+	case rightReal:
+		return b.Right
+	case b.LeftStatus == statusCharging || b.RightStatus == statusCharging:
+		return 100
+	default:
+		return 0
 	}
 }
 
@@ -124,12 +138,12 @@ func main() {
 	// and would be consumed by the next query, desyncing every value after it.
 queries:
 	for _, side := range []struct {
-		name     string
-		level    *int
-		charging *bool
+		name   string
+		level  *int
+		status *sideStatus
 	}{
-		{"left", &battery.Left, &battery.LeftCharging},
-		{"right", &battery.Right, &battery.RightCharging},
+		{"left", &battery.Left, &battery.LeftStatus},
+		{"right", &battery.Right, &battery.RightStatus},
 	} {
 		v, err := queryBatteryField(port, side.name, "level", ch, errCh)
 		if err != nil {
@@ -139,42 +153,57 @@ queries:
 		}
 		*side.level = v
 
-		// status: 0 = discharging, 1 = charging. When charging, the level
-		// command returns a fixed 99 placeholder, so trust status here.
+		// When the side is charging the level is a 99 placeholder; when the
+		// side is unreachable (RF off / out of range) the level is a 100
+		// placeholder. Trust status, not level, to distinguish those states.
 		s, err := queryBatteryField(port, side.name, "status", ch, errCh)
 		if err != nil {
 			log.Printf("failed to get %s battery status: %v", side.name, err)
 			exit = 1
 			break queries
 		}
-		*side.charging = s == 1
+		*side.status = sideStatus(s)
 	}
 
-	fmtSide := func(label string, level int, charging bool) string {
-		if charging {
+	fmtSide := func(label string, level int, status sideStatus) string {
+		switch status {
+		case statusCharging:
 			return label + ":CHG"
+		case statusDisconnected:
+			return label + ":OFF"
+		default:
+			return fmt.Sprintf("%s:%d%%", label, level)
 		}
-		return fmt.Sprintf("%s:%d%%", label, level)
 	}
-	fmtTooltipSide := func(label string, level int, charging bool) string {
-		if charging {
+	fmtTooltipSide := func(label string, level int, status sideStatus) string {
+		switch status {
+		case statusCharging:
 			return label + " side: charging"
+		case statusDisconnected:
+			return label + " side: not connected"
+		default:
+			return fmt.Sprintf("%s side: %d%%", label, level)
 		}
-		return fmt.Sprintf("%s side: %d%%", label, level)
 	}
 
 	output := WaybarOutput{
-		Text: fmtSide("L", battery.Left, battery.LeftCharging) + " " +
-			fmtSide("R", battery.Right, battery.RightCharging),
-		Tooltip: fmtTooltipSide("Left", battery.Left, battery.LeftCharging) + "\r" +
-			fmtTooltipSide("Right", battery.Right, battery.RightCharging),
-		Percentage: chargingAwarePercentage(battery),
+		Text: fmtSide("L", battery.Left, battery.LeftStatus) + " " +
+			fmtSide("R", battery.Right, battery.RightStatus),
+		Tooltip: fmtTooltipSide("Left", battery.Left, battery.LeftStatus) + "\r" +
+			fmtTooltipSide("Right", battery.Right, battery.RightStatus),
+		Percentage: percentageForIcon(battery),
 	}
 
+	anyDisconnected := battery.LeftStatus == statusDisconnected || battery.RightStatus == statusDisconnected
+	anyCharging := battery.LeftStatus == statusCharging || battery.RightStatus == statusCharging
+	leftLow := battery.LeftStatus == statusDischarging && battery.Left < 20
+	rightLow := battery.RightStatus == statusDischarging && battery.Right < 20
 	switch {
-	case battery.LeftCharging || battery.RightCharging:
+	case anyDisconnected:
+		output.Class = "disconnected"
+	case anyCharging:
 		output.Class = "charging"
-	case battery.Left < 20 || battery.Right < 20:
+	case leftLow || rightLow:
 		output.Class = "critical"
 	}
 
