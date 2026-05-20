@@ -55,8 +55,8 @@ curl -L https://dygma-indicator.coolapso.sh/install.sh | VERSION="v1.1.0" bash
 * Extract the binary
 * Execute it
 
-> [!WARNING]
-> Device detection on MacOS is entirely vibe coded as I have no clue how macs work! If you have a mac and want to make it better, feel free to contribute!
+> [!NOTE]
+> macOS support uses the same USB enumeration as Linux now, but it's tested less. Report issues if you hit them.
 
 ## Usage
 
@@ -71,9 +71,13 @@ dygma-indicator
 
 The application outputs a JSON object with the battery percentage and a corresponding text status.
 
-```jsom
-{"text":"L:50% R:70%","tooltip":"Left side: 50%\rRight side: 70%","percentage":50}
+```json
+{"text":"L:50% R:70%","tooltip":"Left side: 50%\nRight side: 70%","percentage":50}
 ```
+
+- `text` shows per-side state: `L:NN%` for a discharging side, `L:CHG` when charging, `L:OFF` when the side is off / out of range, `L:?` if the firmware reports an unknown state.
+- `tooltip` is the human-readable equivalent, one line per side.
+- `class` is one of `unknown`, `critical`, `disconnected`, `charging`, `error` (the tool itself failed — text will be `?`), or absent (omitempty). Listed in precedence order; style via waybar CSS.
 
 ### Waybar
 
@@ -103,6 +107,20 @@ To use this with `waybar`, add the following configuration to your `config` file
 
 > [!IMPORTANT]
 > The serial protocol used by the keyboard can only be used by one application at a time. It is recommended to set a reasonably high `interval` (e.g., 3600 seconds) to avoid blocking other applications like Bazecor when you need to use them.
+
+# Troubleshooting
+
+### Permission denied / "could not open port"
+
+On Linux you usually need to be in the `dialout` group (Debian/Ubuntu) or `uucp` group (Arch). Run `sudo usermod -aG dialout $USER`, then log out and back in.
+
+### Finding the device path manually
+
+If discovery fails, check whether the OS sees the keyboard at all. Linux: `ls /dev/serial/by-id/` should show a Dygma entry. macOS: `ls /dev/cu.usbmodem*`.
+
+### `error: port busy` or it works once and then never again
+
+Something else is holding the serial port — Bazecor, a stale serial monitor, or a previous run of this tool that crashed without releasing it. Close them. This is also why the waybar config above uses `interval: 3600`; don't drop it lower or you'll block Bazecor when you try to use it.
 
 # Contributions
 
