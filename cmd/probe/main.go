@@ -2,25 +2,31 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
 
 	"dygma-indicator/internal/neuron"
 )
 
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	dev, err := neuron.FindDev()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	fmt.Fprintf(os.Stderr, "Using device: %s\n\n", dev)
 
 	client, err := neuron.Open(dev)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer client.Close()
-	client.SetDebug(os.Stdout)
+	client.SetDebug(os.Stderr)
 
 	commands := []string{
 		"help",
@@ -53,8 +59,10 @@ func main() {
 		fmt.Printf("=== %s ===\n", cmd)
 		resp, err := client.Query(cmd)
 		if err != nil {
-			fmt.Printf("  error: %v\n", err)
+			fmt.Printf("  error: %v\n\n", err)
+			break
 		}
 		fmt.Printf("  %s\n\n", resp)
 	}
+	return nil
 }

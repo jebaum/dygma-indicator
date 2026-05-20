@@ -4,9 +4,10 @@ A one-shot CLI that queries a Dygma keyboard's neuron (USB dongle) over serial, 
 
 ## Files
 
-- `main.go` — query loop and output formatting.
-- `find_dev_darwin.go` (Darwin) / `find_dev_generic.go` (`!darwin`) — neuron discovery by USB vendor ID (`1209`, `35ef`). Per the README, the Darwin path is unverified.
-- `cmd/probe/main.go` — diagnostic tool that fires a list of commands and dumps raw + hex responses. Extend its `commands` slice when investigating a new firmware state.
+- `main.go` — query loop, rendering (`render`, `classify`, `percentageForIcon`), and output formatting.
+- `internal/neuron/neuron.go` — neuron discovery (`FindDev`) by USB VID, plus the `Client` that owns the serial port and the `\r\n.\r\n`-framed `Query` protocol. Cross-platform via `go.bug.st/serial/enumerator`.
+- `cmd/probe/main.go` — diagnostic tool that fires a list of commands and prints each response. With `--debug` on the `Client`, the `> cmd` / `< chunk` wire traffic is logged to stderr (probe enables this by default). Extend its `commands` slice when investigating a new firmware state.
+- `internal/neuron/neuron_test.go`, `main_test.go` — table-driven tests for the framing protocol and the rendering/classify logic.
 
 ## Serial protocol
 
@@ -31,7 +32,7 @@ Status values outside this table have not been observed; the code falls through 
 
 ## Query loop invariant
 
-`main.go` bails on the first failed query (timeout or parse error). A late reply for an aborted command would otherwise be consumed as the response to the *next* command, desyncing every value after it. Don't change this without designing a resync.
+`main.go` bails on the first failed query (timeout or parse error). A late reply for an aborted command would otherwise be consumed as the response to the *next* command, desyncing every value after it. Don't change this without designing a resync. (The same invariant is documented on `neuron.Client.Query`'s godoc.)
 
 ## Firmware command catalogue
 
@@ -58,7 +59,5 @@ Out of scope for this tool but available: `keymap.*`, `led.*`, `superkeys.*`, `q
 When firmware behavior is unclear (e.g. a new sentinel value, an undocumented state):
 
 1. Add the commands of interest to `cmd/probe/main.go`'s `commands` slice.
-2. `go build -o bin/probe ./cmd/probe && bin/probe > some-state.txt` while the keyboard is in the state being investigated. `bin/` is git-ignored.
-3. Compare the captured `raw` / `hex` outputs across states to find the discriminating field.
-
-The `raw` and `hex` views matter together — trailing spaces and `\r` placement vary between commands and aren't visible in `raw` alone.
+2. `go build -o bin/probe ./cmd/probe && bin/probe > some-state.txt 2>&1` while the keyboard is in the state being investigated. `bin/` is git-ignored.
+3. Compare the captured response payloads and the `< chunk` lines (Go's `%q` formatting shows trailing spaces, `\r`, and `\n` explicitly) across states to find the discriminating field.

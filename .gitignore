@@ -1,2 +1,5 @@
-dygma-indicator
+/dygma-indicator
 /bin/
+/dist/
+coverage.out
+*.test
