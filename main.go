@@ -1,20 +1,14 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"strconv"
-	"strings"
-	"time"
 
-	"go.bug.st/serial"
+	"dygma-indicator/internal/neuron"
 )
-
-var vendorIds = []string{"1209", "35ef"}
 
 // sideStatus mirrors `wireless.battery.<side>.status` returned by the firmware.
 // 0 = discharging, 1 = charging, 4 = unreachable (RF off / out of range).
@@ -39,56 +33,14 @@ type WaybarOutput struct {
 	Percentage int    `json:"percentage"`
 }
 
-func readFromPort(ctx context.Context, port serial.Port, ch chan<- int, errCh chan<- error) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			buff := make([]byte, 4)
-			n, err := port.Read(buff)
-			if err != nil {
-				if err.Error() != "EOF" {
-					errCh <- fmt.Errorf("error reading from port: %w", err)
-					return
-				}
-				continue
-			}
-
-			if n > 0 {
-				response := strings.TrimSuffix(string(bytes.TrimSpace(buff[:n])), ".")
-				if response == "" {
-					continue
-				}
-				v, err := strconv.Atoi(response)
-				if err != nil {
-					errCh <- fmt.Errorf("failed to parse %q", response)
-					return
-				}
-				ch <- v
-			}
-		}
-	}
-}
-
-const queryTimeout = 2 * time.Second
-
 // queryBatteryField sends `wireless.battery.<side>.<field>` and returns the
 // integer the keyboard replies with. `field` is either "level" or "status".
-func queryBatteryField(port serial.Port, side, field string, ch <-chan int, errCh <-chan error) (int, error) {
-	command := "wireless.battery." + side + "." + field + "\n"
-	if _, err := port.Write([]byte(command)); err != nil {
-		return 0, fmt.Errorf("failed to send command to keyboard: %w", err)
-	}
-
-	select {
-	case v := <-ch:
-		return v, nil
-	case err := <-errCh:
+func queryBatteryField(c *neuron.Client, side, field string) (int, error) {
+	resp, err := c.Query("wireless.battery." + side + "." + field)
+	if err != nil {
 		return 0, err
-	case <-time.After(queryTimeout):
-		return 0, fmt.Errorf("timed out waiting for %s.%s response", side, field)
 	}
+	return strconv.Atoi(resp)
 }
 
 // percentageForIcon picks a value for waybar's icon picker. The firmware
@@ -115,22 +67,15 @@ func percentageForIcon(b batteryLevel) int {
 }
 
 func main() {
-	dev, err := findKeyboardDev()
+	dev, err := neuron.FindDev()
 	if err != nil {
 		log.Fatal("Could not find keyboard:", err)
 	}
-	mode := &serial.Mode{BaudRate: 9600}
-	port, err := serial.Open(dev, mode)
+	client, err := neuron.Open(dev)
 	if err != nil {
 		log.Fatal("failed to open port:", err)
 	}
-	defer port.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	ch := make(chan int)
-	errCh := make(chan error, 1)
-	go readFromPort(ctx, port, ch, errCh)
+	defer client.Close()
 
 	battery := batteryLevel{}
 	var exit int
@@ -145,7 +90,7 @@ queries:
 		{"left", &battery.Left, &battery.LeftStatus},
 		{"right", &battery.Right, &battery.RightStatus},
 	} {
-		v, err := queryBatteryField(port, side.name, "level", ch, errCh)
+		v, err := queryBatteryField(client, side.name, "level")
 		if err != nil {
 			log.Printf("failed to get %s battery level: %v", side.name, err)
 			exit = 1
@@ -156,7 +101,7 @@ queries:
 		// When the side is charging the level is a 99 placeholder; when the
 		// side is unreachable (RF off / out of range) the level is a 100
 		// placeholder. Trust status, not level, to distinguish those states.
-		s, err := queryBatteryField(port, side.name, "status", ch, errCh)
+		s, err := queryBatteryField(client, side.name, "status")
 		if err != nil {
 			log.Printf("failed to get %s battery status: %v", side.name, err)
 			exit = 1
