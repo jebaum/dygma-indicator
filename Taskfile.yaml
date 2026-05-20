@@ -1,6 +1,24 @@
 version: "3"
 
+vars:
+  VERSION: '{{.VERSION | default "dev"}}'
+  LDFLAGS: -s -w -X main.version={{.VERSION}}
+
 tasks:
   build:
+    desc: Build the CLI for the current platform
     cmds:
-      - go CGO_ENABLED=0 build -o ./dygma-indicator .
+      # go.bug.st/serial/enumerator needs cgo on darwin; leave CGO at the Go default.
+      - go build -ldflags "{{.LDFLAGS}}" -o ./bin/dygma-indicator .
+  probe:
+    desc: Build the probe diagnostic tool
+    cmds:
+      - go build -o ./bin/probe ./cmd/probe
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -rf ./bin ./dist ./dygma-indicator
+  release-dry-run:
+    desc: Run goreleaser locally without publishing
+    cmds:
+      - goreleaser release --snapshot --clean --skip=publish
