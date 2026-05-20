@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -67,9 +68,13 @@ func (s sideStatus) tooltip(label string, level int) string {
 	}
 }
 
-type batteryLevel struct {
-	Left, Right             int
-	LeftStatus, RightStatus sideStatus
+type sideReading struct {
+	Level  int
+	Status sideStatus
+}
+
+type batteryState struct {
+	Left, Right sideReading
 }
 
 type waybarOutput struct {
@@ -86,22 +91,26 @@ func queryBatteryField(c *neuron.Client, side, field string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return strconv.Atoi(resp)
+	n, err := strconv.Atoi(resp)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s.%s response %q: %w", side, field, resp, err)
+	}
+	return n, nil
 }
 
 // querySide fetches both the level and status for a single side. Returns on
 // the first error so the caller doesn't consume a late reply as the response
 // to a subsequent query.
-func querySide(c *neuron.Client, side string) (level int, status sideStatus, err error) {
-	level, err = queryBatteryField(c, side, "level")
+func querySide(c *neuron.Client, side string) (sideReading, error) {
+	level, err := queryBatteryField(c, side, "level")
 	if err != nil {
-		return 0, 0, fmt.Errorf("%s level: %w", side, err)
+		return sideReading{}, fmt.Errorf("%s level: %w", side, err)
 	}
 	s, err := queryBatteryField(c, side, "status")
 	if err != nil {
-		return 0, 0, fmt.Errorf("%s status: %w", side, err)
+		return sideReading{}, fmt.Errorf("%s status: %w", side, err)
 	}
-	return level, sideStatus(s), nil
+	return sideReading{Level: level, Status: sideStatus(s)}, nil
 }
 
 // percentageForIcon picks a value for waybar's icon picker. The firmware
@@ -111,34 +120,79 @@ func querySide(c *neuron.Client, side string) (level int, status sideStatus, err
 // 100 if any side is charging (semantically "full") or 0 otherwise
 // (semantically "no battery info"). Unknown statuses are intentionally not
 // treated as real readings here.
-func percentageForIcon(b batteryLevel) int {
-	leftReal := b.LeftStatus == statusDischarging
-	rightReal := b.RightStatus == statusDischarging
+func percentageForIcon(b batteryState) int {
+	leftReal := b.Left.Status == statusDischarging
+	rightReal := b.Right.Status == statusDischarging
 	switch {
 	case leftReal && rightReal:
-		return min(b.Left, b.Right)
+		return min(b.Left.Level, b.Right.Level)
 	case leftReal:
-		return b.Left
+		return b.Left.Level
 	case rightReal:
-		return b.Right
-	case b.LeftStatus == statusCharging || b.RightStatus == statusCharging:
+		return b.Right.Level
+	case b.Left.Status == statusCharging || b.Right.Status == statusCharging:
 		return 100
 	default:
 		return 0
 	}
 }
 
+// classify returns the waybar class for a battery state, following the
+// precedence: unknown > critical > disconnected > charging > (empty).
+func classify(b batteryState) string {
+	leftUnknown := !b.Left.Status.known()
+	rightUnknown := !b.Right.Status.known()
+	anyDisconnected := b.Left.Status == statusDisconnected || b.Right.Status == statusDisconnected
+	anyCharging := b.Left.Status == statusCharging || b.Right.Status == statusCharging
+	leftLow := b.Left.Status == statusDischarging && b.Left.Level < lowBatteryThreshold
+	rightLow := b.Right.Status == statusDischarging && b.Right.Level < lowBatteryThreshold
+	switch {
+	case leftUnknown || rightUnknown:
+		return "unknown"
+	case leftLow || rightLow:
+		return "critical"
+	case anyDisconnected:
+		return "disconnected"
+	case anyCharging:
+		return "charging"
+	}
+	return ""
+}
+
+// render builds the waybar output for a battery state. Pure: no I/O.
+func render(b batteryState) waybarOutput {
+	return waybarOutput{
+		Text: b.Left.Status.text("L", b.Left.Level) + " " +
+			b.Right.Status.text("R", b.Right.Level),
+		Tooltip: b.Left.Status.tooltip("Left", b.Left.Level) + "\n" +
+			b.Right.Status.tooltip("Right", b.Right.Level),
+		Class:      classify(b),
+		Percentage: percentageForIcon(b),
+	}
+}
+
+// emit writes a waybar JSON line to stdout. Used by both success and error paths.
+func emit(out waybarOutput) {
+	b, err := json.Marshal(out)
+	if err != nil {
+		// waybarOutput only has string/int fields, so this is unreachable
+		// in practice. Fall back to a hand-rolled JSON string so the module
+		// never goes silent.
+		fmt.Println(`{"text":"?","class":"error","tooltip":"json marshal failed"}`)
+		return
+	}
+	fmt.Println(string(b))
+}
+
 // emitErrorJSON writes a valid waybar JSON payload describing an error
 // condition. Waybar shows the text + tooltip + class so the user sees
 // something actionable instead of an empty/broken module.
 func emitErrorJSON(err error) {
-	out := waybarOutput{
+	emit(waybarOutput{
 		Text:    "?",
 		Tooltip: err.Error(),
 		Class:   "error",
-	}
-	b, _ := json.Marshal(out)
-	fmt.Println(string(b))
+	})
 }
 
 func main() {
@@ -164,6 +218,9 @@ func run(device string, debug bool) error {
 		var err error
 		dev, err = neuron.FindDev()
 		if err != nil {
+			if errors.Is(err, neuron.ErrNotFound) {
+				return fmt.Errorf("no Dygma keyboard detected (is the neuron plugged in?): %w", err)
+			}
 			return fmt.Errorf("could not find keyboard: %w", err)
 		}
 	}
@@ -177,53 +234,24 @@ func run(device string, debug bool) error {
 		client.SetDebug(os.Stderr)
 	}
 
-	battery := batteryLevel{}
+	state, err := queryBatteryState(client)
+	if err != nil {
+		return err
+	}
+	emit(render(state))
+	return nil
+}
+
+func queryBatteryState(c *neuron.Client) (batteryState, error) {
 	// Bail on the first failure: a timed-out reply may still arrive later
 	// and would be consumed by the next query, desyncing every value after it.
-	battery.Left, battery.LeftStatus, err = querySide(client, "left")
+	left, err := querySide(c, "left")
 	if err != nil {
-		return err
+		return batteryState{}, err
 	}
-	battery.Right, battery.RightStatus, err = querySide(client, "right")
+	right, err := querySide(c, "right")
 	if err != nil {
-		return err
+		return batteryState{}, err
 	}
-
-	output := waybarOutput{
-		Text: battery.LeftStatus.text("L", battery.Left) + " " +
-			battery.RightStatus.text("R", battery.Right),
-		Tooltip: battery.LeftStatus.tooltip("Left", battery.Left) + "\n" +
-			battery.RightStatus.tooltip("Right", battery.Right),
-		Percentage: percentageForIcon(battery),
-	}
-
-	leftUnknown := !battery.LeftStatus.known()
-	rightUnknown := !battery.RightStatus.known()
-	anyDisconnected := battery.LeftStatus == statusDisconnected || battery.RightStatus == statusDisconnected
-	anyCharging := battery.LeftStatus == statusCharging || battery.RightStatus == statusCharging
-	leftLow := battery.LeftStatus == statusDischarging && battery.Left < lowBatteryThreshold
-	rightLow := battery.RightStatus == statusDischarging && battery.Right < lowBatteryThreshold
-	// Class precedence (highest first):
-	//   unknown      — a status value we don't model; don't trust the rest.
-	//   critical     — a real discharging side below the low threshold.
-	//   disconnected — more informative than charging (which is transient).
-	//   charging     — at least one side plugged in.
-	switch {
-	case leftUnknown || rightUnknown:
-		output.Class = "unknown"
-	case leftLow || rightLow:
-		output.Class = "critical"
-	case anyDisconnected:
-		output.Class = "disconnected"
-	case anyCharging:
-		output.Class = "charging"
-	}
-
-	jsonOutput, err := json.Marshal(output)
-	if err != nil {
-		return fmt.Errorf("failed to marshal json: %w", err)
-	}
-
-	fmt.Println(string(jsonOutput))
-	return nil
+	return batteryState{Left: left, Right: right}, nil
 }
